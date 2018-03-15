@@ -1,0 +1,210 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: 'AWS::Serverless-2016-10-31'
+Description: 'This template deploys a serverless application for creating + retaining AMIs from properly tagged EC2 instances'
+Metadata:
+  'AWS::CloudFormation::Interface':
+    ParameterGroups:
+    - Label:
+        default: 'Parameters'
+      Parameters:
+      - S3Bucket
+      - WriteSchedule   
+      - CopySchedule   
+      - TagSchedule   
+      - RetentionSchedule
+Parameters:
+  S3Bucket:
+    Description: 'S3 bucket containing lambda code zip archives'
+    Type: String
+    Default: 'sam-recovery'
+  WriteSchedule:
+    Description: 'UTC cron schedule for triggering image creation'
+    Type: String
+    Default: 'cron(10 1 ? * MON *)'
+  CopySchedule:
+    Description: 'UTC cron schedule for triggering image copy'
+    Type: String
+    Default: 'cron(25 1 ? * MON *)'
+  TagSchedule:
+    Description: 'UTC cron schedule for triggering copy image tagging'
+    Type: String
+    Default: 'cron(35 3 ? * MON *)'
+  RetentionSchedule:
+    Description: 'UTC cron schedule for triggering AMI cleanup'
+    Type: String
+    Default: 'cron(45 4 ? * MON *)'
+Resources:
+  IAMRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - 'lambda.amazonaws.com'
+          Action:
+          - 'sts:AssumeRole'
+      Path: '/'
+      Policies:
+      - PolicyName: dr-access
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - 'sts:DecodeAuthorizationMessage'
+            - 'ec2:CreateImage'
+            - 'ec2:CopyImage'
+            - 'ec2:CreateSnapshot'
+            - 'ec2:CreateTags'
+            - 'ec2:DeleteSnapshot'
+            - 'ec2:DescribeInstances'
+            - 'ec2:DescribeImages'
+            - 'ec2:DescribeSnapshotAttribute'
+            - 'ec2:DescribeSnapshots'
+            - 'ec2:DescribeVolumeAttribute'
+            - 'ec2:DescribeVolumeStatus'
+            - 'ec2:DescribeVolumes'
+            - 'ec2:StartInstances'
+            - 'ec2:StopInstances'
+            - 'dynamodb:*'
+            Resource:
+            - '*'
+  DRAMIRetention:
+    Type: 'AWS::Serverless::Function'
+    Properties:
+      Handler: lambda_function.lambda_handler
+      Runtime: python2.7
+      CodeUri:
+        Bucket: !Ref S3Bucket
+        Key: 'sam-recovery-retention.zip'
+      Description: Remove DR AMI + Snapshots
+      MemorySize: 1024
+      Timeout: 300
+      Role: !GetAtt IAMRole.Arn
+      Events:
+        Schedule1:
+          Type: Schedule
+          Properties:
+            Schedule: !Ref RetentionSchedule
+  DRDynamoTag:
+    Type: 'AWS::Serverless::Function'
+    Properties:
+      Handler: lambda_function.lambda_handler
+      Runtime: python2.7
+      CodeUri:
+        Bucket: !Ref S3Bucket
+        Key: 'sam-recovery-tag.zip'
+      Description: Tag AMIs in destination region w/ name tag
+      MemorySize: 1024
+      Timeout: 300
+      Role: !GetAtt IAMRole.Arn
+      Events:
+        Schedule1:
+          Type: Schedule
+          Properties:
+            Schedule: !Ref TagSchedule
+  DRDynamoDBRead:
+    Type: 'AWS::Serverless::Function'
+    Properties:
+      Handler: lambda_function.lambda_handler
+      Runtime: python2.7
+      CodeUri:
+        Bucket: !Ref S3Bucket
+        Key: 'sam-recovery-copy.zip'
+      Description: Copy DR AMIs to target regions
+      MemorySize: 1024
+      Timeout: 300
+      Role: !GetAtt IAMRole.Arn
+      Events:
+        Schedule1:
+          Type: Schedule
+          Properties:
+            Schedule: !Ref CopySchedule
+  DRDynamoWrite:
+    Type: 'AWS::Serverless::Function'
+    Properties:
+      Handler: lambda_function.lambda_handler
+      Runtime: python2.7
+      CodeUri: 
+        Bucket: !Ref S3Bucket
+        Key: 'sam-recovery-write.zip'
+      Description: Create recovery AMIs for critical resources
+      MemorySize: 1024
+      Timeout: 300
+      Role: !GetAtt IAMRole.Arn
+      Events:
+        Schedule1:
+          Type: Schedule
+          Properties:
+            Schedule: !Ref WriteSchedule
+
+  DynamoDBTableSource: 
+    Type: "AWS::DynamoDB::Table"
+    Properties: 
+      AttributeDefinitions: 
+        - 
+          AttributeName: "ami_name"
+          AttributeType: "S"
+        -
+          AttributeName: "date"
+          AttributeType: "S"
+      KeySchema:
+        -
+          AttributeName: "ami_name"
+          KeyType: "HASH"
+        -
+          AttributeName: "date"
+          KeyType: "RANGE"
+      ProvisionedThroughput: 
+        ReadCapacityUnits: "5"
+        WriteCapacityUnits: "5"
+      TableName: "AMI-Source"
+      GlobalSecondaryIndexes: 
+        - 
+          IndexName: "ami_id"
+          KeySchema: 
+            - 
+              AttributeName: "date"
+              KeyType: "HASH"
+          Projection:
+            ProjectionType: "ALL"
+          ProvisionedThroughput: 
+            ReadCapacityUnits: "5"
+            WriteCapacityUnits: "5"
+
+  DynamoDBTableTarget:
+    Type: "AWS::DynamoDB::Table"
+    Properties: 
+      AttributeDefinitions: 
+        - 
+          AttributeName: "ami_name"
+          AttributeType: "S"
+        - 
+          AttributeName: "date"
+          AttributeType: "S"
+      KeySchema: 
+        - 
+          AttributeName: "ami_name"
+          KeyType: "HASH"
+        - 
+          AttributeName: "date"
+          KeyType: "RANGE"
+      ProvisionedThroughput: 
+        ReadCapacityUnits: "5"
+        WriteCapacityUnits: "5"
+      TableName: "AMI-Target"
+      GlobalSecondaryIndexes: 
+        - 
+          IndexName: "ami_id"
+          KeySchema: 
+            - 
+              AttributeName: "date"
+              KeyType: "HASH"
+          Projection:
+            ProjectionType: "ALL"
+          ProvisionedThroughput: 
+            ReadCapacityUnits: "5"
+            WriteCapacityUnits: "5"
